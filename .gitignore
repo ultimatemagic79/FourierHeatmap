@@ -11,3 +11,4 @@ data
 outputs
 weight
 venv
+pretrain/ckpt

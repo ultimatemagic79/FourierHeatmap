@@ -22,14 +22,19 @@ If you use this implementation in you work, please don't forget to mention the
 author, Yerlan Idelbayev.
 """
 from typing import Callable, List, Type
+from collections import OrderedDict
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from timm.models.helpers import checkpoint_seq
 
 __all__ = [
+    "resnet18",
     "resnet20",
+    "resnet26",
     "resnet32",
     "resnet44",
     "resnet56",
@@ -44,6 +49,27 @@ def _weights_init(m: nn.Module) -> None:
         init.kaiming_normal(m.weight)
 
 
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding."
+    return nn.Conv2d(
+        in_channels=in_planes,
+        out_channels=out_planes,
+        kernel_size=3,
+        stride=stride,
+        padding=1,
+        bias=False,
+    )
+
+
+def norm2d(group_norm_num_groups, planes):
+    if group_norm_num_groups is not None and group_norm_num_groups > 0:
+        # group_norm_num_groups == planes -> InstanceNorm
+        # group_norm_num_groups == 1 -> LayerNorm
+        return nn.GroupNorm(group_norm_num_groups, planes)
+    else:
+        return nn.BatchNorm2d(planes)
+
+
 class LambdaLayer(nn.Module):
     def __init__(self, lambd: Callable[[torch.Tensor], torch.Tensor]) -> None:
         super(LambdaLayer, self).__init__()
@@ -51,6 +77,18 @@ class LambdaLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lambd(x)
+
+
+class CustomSequential(nn.Module):
+    def __init__(self, *modules):
+        super(CustomSequential, self).__init__()
+        for idx, module in enumerate(modules):
+            self.add_module(str(idx), module)
+
+    def forward(self, x, augmix=False):
+        for module in self._modules.values():
+            x = module(x, augmix=augmix)
+        return x
 
 
 class BasicBlock(nn.Module):
@@ -143,6 +181,281 @@ class ResNet(nn.Module):
         logit = self.linear(rep)
 
         return logit
+
+
+class BaseBasicBlock(nn.Module):
+    """
+    [3 * 3, 64]
+    [3 * 3, 64]
+    """
+
+    expansion = 1
+
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        stride=1,
+        downsample=None,
+        group_norm_num_groups=None,
+    ):
+        super(BaseBasicBlock, self).__init__()
+        self.conv1 = conv3x3(in_planes, out_planes, stride)
+        self.bn1 = norm2d(group_norm_num_groups, planes=out_planes)
+        self.bn1_aug = norm2d(group_norm_num_groups, planes=out_planes)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = conv3x3(out_planes, out_planes)
+        self.bn2 = norm2d(group_norm_num_groups, planes=out_planes)
+        self.bn2_aug = norm2d(group_norm_num_groups, planes=out_planes)
+
+        self.downsample = downsample
+        self.stride = stride
+
+        # some stats
+        self.nn_mass = in_planes + out_planes
+
+    def forward(self, x, augmix=False):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1_aug(out) if augmix else self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2_aug(out) if augmix else self.bn2(out)
+
+        if self.downsample is not None:
+            x = self.downsample[0](x)
+            residual = self.downsample[2](x) if augmix else self.downsample[1](x)
+
+        out = out.expand_as(residual) + residual
+        out = self.relu(out)
+
+        return out
+
+
+class ResNetBase(nn.Module):
+    def _init_conv(self, module):
+        out_channels, _, kernel_size0, kernel_size1 = module.weight.size()
+        n = kernel_size0 * kernel_size1 * out_channels
+        module.weight.data.normal_(0, math.sqrt(2.0 / n))
+
+    def _init_bn(self, module):
+        module.weight.data.fill_(1)
+        module.bias.data.zero_()
+
+    def _init_fc(self, module):
+        module.weight.data.normal_(mean=0, std=0.01)
+        if module.bias is not None:
+            module.bias.data.zero_()
+
+    def _weight_initialization(self):
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Conv2d):
+                self._init_conv(module)
+            elif isinstance(module, nn.BatchNorm2d):
+                self._init_bn(module)
+            elif isinstance(module, nn.Linear):
+                self._init_fc(module)
+
+    def _make_block(self, block_fn, planes, block_num, stride=1, group_norm_num_groups=None):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block_fn.expansion:
+            downsample = nn.Sequential(
+                OrderedDict(
+                    [
+                        (
+                            "conv",
+                            nn.Conv2d(
+                                self.inplanes,
+                                planes * block_fn.expansion,
+                                kernel_size=1,
+                                stride=stride,
+                                bias=False,
+                            ),
+                        ),
+                        (
+                            "bn",
+                            norm2d(
+                                group_norm_num_groups,
+                                planes=planes * block_fn.expansion,
+                            ),
+                        ),
+                        (
+                            "bn_aug",
+                            norm2d(
+                                group_norm_num_groups,
+                                planes=planes * block_fn.expansion,
+                            ),
+                        ),
+                    ]
+                )
+            )
+
+        layers = []
+        layers.append(
+            block_fn(
+                in_planes=self.inplanes,
+                out_planes=planes,
+                stride=stride,
+                downsample=downsample,
+                group_norm_num_groups=group_norm_num_groups,
+            )
+        )
+        self.inplanes = planes * block_fn.expansion
+
+        for _ in range(1, block_num):
+            layers.append(
+                block_fn(
+                    in_planes=self.inplanes,
+                    out_planes=planes,
+                    group_norm_num_groups=group_norm_num_groups,
+                )
+            )
+        return CustomSequential(*layers)
+
+
+class ResNetCifar(ResNetBase):
+    def __init__(
+        self,
+        num_classes: int,
+        depth: int,
+        split_point: str = "layer3",
+        group_norm_num_groups: int = None,
+        grad_checkpoint: bool = False,
+    ):
+        super(ResNetCifar, self).__init__()
+        self.num_classes = num_classes
+        if split_point not in ["layer2", "layer3", None]:
+            raise ValueError(f"invalid split position={split_point}.")
+        self.split_point = split_point
+        self.grad_checkpoint = grad_checkpoint
+
+        # define model.
+        self.depth = depth
+        if depth % 6 != 2:
+            raise ValueError("depth must be 6n + 2:", depth)
+        block_nums = (depth - 2) // 6
+        block_fn = BaseBasicBlock
+        self.block_nums = block_nums
+        self.block_fn_name = "Bottleneck" if depth >= 44 else "BasicBlock"
+
+        # define layers.
+        self.inplanes = int(16)
+        self.conv1 = nn.Conv2d(
+            in_channels=3,
+            out_channels=int(16),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = norm2d(group_norm_num_groups, planes=int(16))
+        self.bn1_aug = norm2d(group_norm_num_groups, planes=int(16))
+        self.relu = nn.ReLU(inplace=True)
+
+        self.layer1 = self._make_block(
+            block_fn=block_fn,
+            planes=int(16),
+            block_num=block_nums,
+            group_norm_num_groups=group_norm_num_groups,
+        )
+        self.layer2 = self._make_block(
+            block_fn=block_fn,
+            planes=int(32),
+            block_num=block_nums,
+            stride=2,
+            group_norm_num_groups=group_norm_num_groups,
+        )
+        self.layer3 = self._make_block(
+            block_fn=block_fn,
+            planes=int(64),
+            block_num=block_nums,
+            stride=2,
+            group_norm_num_groups=group_norm_num_groups,
+        )
+
+        self.avgpool = nn.AvgPool2d(kernel_size=8)
+        self.classifier = nn.Linear(
+            in_features=int(64 * block_fn.expansion),
+            out_features=self.num_classes,
+            bias=False,
+        )
+
+        # weight initialization based on layer type.
+        self._weight_initialization()
+        self.train()
+
+    def forward_features(self, x, augmix=False):
+        """Forward function without classifier. Use gradient checkpointing to save memory."""
+        x = self.conv1(x)
+        x = self.bn1_aug(x) if augmix else self.bn1(x)
+        x = self.relu(x)
+
+        if self.grad_checkpoint:
+            x = checkpoint_seq(self.layer1, x, preserve_rng_state=True)
+            x = checkpoint_seq(self.layer2, x, preserve_rng_state=True)
+            if self.split_point in ["layer3", None]:
+                x = checkpoint_seq(self.layer3, x, preserve_rng_state=True)
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+        else:
+            x = self.layer1(x, augmix)
+            x = self.layer2(x, augmix)
+            if self.split_point in ["layer3", None]:
+                x = self.layer3(x, augmix)
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+
+        return x
+
+    def forward_head(self, x, pre_logits: bool = False, augmix=False):
+        """Forward function for classifier. Use gridient checkpointing to save memory."""
+        if self.split_point == "layer2":
+            if self.grad_checkpoint:
+                x = checkpoint_seq(self.layer3, x, preserve_rng_state=True)
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+            else:
+                x = self.layer3(x, augmix)
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+
+        return x if pre_logits else self.classifier(x)
+
+    def forward(self, x, augmix=False):
+        x = self.forward_features(x, augmix=augmix)
+        x = self.forward_head(x, augmix=augmix)
+        return x
+
+
+def resnet18(pretrained: bool = False, num_classes: int = 10) -> nn.Module:
+    """factory class of ResNet-20.
+    Parameters
+    ----------
+    pretrained : bool
+        Rreturn pretrained model. Note: currently just raise error.
+    num_classes : int
+        Number of output class.
+    """
+    if pretrained:
+        raise NotImplementedError("resnet for cifar10 dose not have pretrained models.")
+    return ResNetCifar(num_classes, 18, None, None, False)
+
+
+def resnet26(pretrained: bool = False, num_classes: int = 10) -> nn.Module:
+    """factory class of ResNet-20.
+    Parameters
+    ----------
+    pretrained : bool
+        Rreturn pretrained model. Note: currently just raise error.
+    num_classes : int
+        Number of output class.
+    """
+    if pretrained:
+        raise NotImplementedError("resnet for cifar10 dose not have pretrained models.")
+    return ResNetCifar(num_classes, 26, None, None, False)
 
 
 def resnet20(pretrained: bool = False, num_classes: int = 10) -> nn.Module:

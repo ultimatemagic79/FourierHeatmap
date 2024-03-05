@@ -10,6 +10,18 @@ class ArchConfig(ABC):
 
 
 @dataclass
+class Resnet18Config(ArchConfig):
+    _target_: str = "fhmap.factory.archs.resnet.resnet18"
+    pretrained: bool = False
+
+
+@dataclass
+class Resnet26Config(ArchConfig):
+    _target_: str = "fhmap.factory.archs.resnet.resnet26"
+    pretrained: bool = False
+
+
+@dataclass
 class Resnet50Config(ArchConfig):
     _target_: str = "torchvision.models.resnet50"
     pretrained: bool = False

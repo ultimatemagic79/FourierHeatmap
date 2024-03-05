@@ -49,6 +49,8 @@ class EvalFhmapConfig:
 cs = ConfigStore.instance()
 cs.store(name="eval_fhmap", node=EvalFhmapConfig)
 # arch
+cs.store(group="arch", name="resnet18", node=schema.Resnet18Config)
+cs.store(group="arch", name="resnet26", node=schema.Resnet26Config)
 cs.store(group="arch", name="resnet50", node=schema.Resnet50Config)
 cs.store(group="arch", name="resnet56", node=schema.Resnet56Config)
 cs.store(group="arch", name="wideresnet40", node=schema.Wideresnet40Config)
@@ -85,6 +87,11 @@ def eval_fhmap(cfg: EvalFhmapConfig) -> None:
     device: Final = cfg.env.device
     cwd: Final[pathlib.Path] = pathlib.Path(hydra.utils.get_original_cwd())
     weightpath: Final[pathlib.Path] = pathlib.Path(cfg.weightpath)
+    # weightpath のファイルが実際に存在するか確認する例
+    weightpath_exists = weightpath.exists()
+    print(f"Weight path exists: {weightpath_exists}")
+    if not weightpath_exists:
+        logger.error(f"Weight file not found at {weightpath}")
 
     # Setup datamodule
     root: Final[pathlib.Path] = cwd / "../datasets"

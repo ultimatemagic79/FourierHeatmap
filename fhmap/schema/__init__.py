@@ -1,5 +1,7 @@
 from .arch import (  # noqa # NOTE: If you want to add your architecture, please add YourCustomArchConfig class in this line.
     ArchConfig,
+    Resnet18Config,
+    Resnet26Config,
     Resnet50Config,
     Resnet56Config,
     Wideresnet40Config,

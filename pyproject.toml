@@ -16,6 +16,7 @@ hydra-core = "^1.0.6"
 pytorch-lightning = "^1.2.6"
 matplotlib = "^3.4.1"
 seaborn = "^0.11.1"
+timm = "^0.9.16"
 
 [tool.poetry.dev-dependencies]
 pysen = "^0.9.1"
