@@ -87,11 +87,6 @@ def eval_fhmap(cfg: EvalFhmapConfig) -> None:
     device: Final = cfg.env.device
     cwd: Final[pathlib.Path] = pathlib.Path(hydra.utils.get_original_cwd())
     weightpath: Final[pathlib.Path] = pathlib.Path(cfg.weightpath)
-    # weightpath のファイルが実際に存在するか確認する例
-    weightpath_exists = weightpath.exists()
-    print(f"Weight path exists: {weightpath_exists}")
-    if not weightpath_exists:
-        logger.error(f"Weight file not found at {weightpath}")
 
     # Setup datamodule
     root: Final[pathlib.Path] = cwd / "../datasets"
@@ -102,7 +97,10 @@ def eval_fhmap(cfg: EvalFhmapConfig) -> None:
 
     # Setup model
     arch = instantiate(cfg.arch, num_classes=datamodule.num_classes)
-    arch.load_state_dict(torch.load(weightpath))
+    ckpt = torch.load(weightpath, map_location=device)
+    arch_dict = arch.state_dict()
+    arch_dict.update(ckpt["model"])
+    arch.load_state_dict(arch_dict)
     arch = arch.to(device)
     arch.eval()
     logger.info("architecture setup: done.")
