@@ -87,7 +87,7 @@ def eval_fhmap(cfg: EvalFhmapConfig) -> None:
     weightpath: Final[pathlib.Path] = pathlib.Path(cfg.weightpath)
 
     # Setup datamodule
-    root: Final[pathlib.Path] = cwd / "data"
+    root: Final[pathlib.Path] = cwd / "../datasets"
     datamodule = instantiate(cfg.dataset, cfg.batch_size, cfg.env.num_workers, root)
     datamodule.prepare_data()
     datamodule.setup()
