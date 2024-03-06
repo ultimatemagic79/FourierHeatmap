@@ -12,3 +12,4 @@ outputs
 weight
 venv
 pretrain/ckpt
+provision/docker/.env

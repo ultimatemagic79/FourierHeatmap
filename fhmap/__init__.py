@@ -73,3 +73,34 @@ def eval_mean_errors(
             err_dict[k].append(err.item())
 
     return [sum(err_dict[k]) / len(err_dict[k]) for k in err_dict]
+
+
+def eval_batchnorm_similarity(
+    arch: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    topk: Tuple[int, ...] = (1,),
+) -> List[float]:
+    """フーリエノイズが加えられる前後のBN出力の類似度計算
+
+    Args:
+        arch (nn.Module): An architecture to be evaluated.
+        loader (DataLoader): A dataloader.
+        device (torch.device): A device used for calculation.
+        topk (Tuple[int, ...]): Tuple of int which you want to know error.
+
+    Returns:
+        List[float]: list of mean errors.
+
+    """
+    arch = arch.to(device)
+    err_dict: Dict[int, List[float]] = {k: list() for k in topk}
+
+    for x, t in loader:
+        x, t = x.to(device), t.to(device)
+
+        output = arch(x)
+        for k, err in zip(topk, calc_errors(output, t, topk=topk)):
+            err_dict[k].append(err.item())
+
+    return [sum(err_dict[k]) / len(err_dict[k]) for k in err_dict]

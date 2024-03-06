@@ -10,13 +10,19 @@ services:
     ports:
       - 9000:8000
     # Following is needed for use GPU in the container
-    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     # Following is needed for setting access permission of file
     user: ${UID}:${GIU}
     volumes:
       - type: bind
         source: ${HOST_DATADIR}
-        target: ${INSTALL_DIRECTORY}/FourierHeatmap/data
+        target: ${INSTALL_DIRECTORY}/FourierHeatmap/../datasets
       - type: bind
         source: ${HOST_OUTPUTSDIR}
         target: ${INSTALL_DIRECTORY}/FourierHeatmap/outputs

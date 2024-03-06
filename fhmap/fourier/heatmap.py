@@ -150,7 +150,7 @@ def eval_fourier_heatmap(
             insert_fourier_noise(noised_transforms, basis)
 
             # overwrite torchvision.transforms.Compose.transforms
-            dataset.transform.transforms = noised_transforms
+            # dataset.transform.transforms = noised_transforms
 
             loader = DataLoader(
                 dataset,
