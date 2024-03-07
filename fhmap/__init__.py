@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .fourier.heatmap import eval_fourier_heatmap  # noqa
+from .fourier.heatmap import eval_fourier_heatmap, AdaptiveBatchNorm  # noqa
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +46,7 @@ def calc_errors(
 
 def eval_mean_errors(
     arch: nn.Module,
+    bn_adapt_arch: nn.Module,
     loader: DataLoader,
     device: torch.device,
     topk: Tuple[int, ...] = (1,),
@@ -63,16 +64,23 @@ def eval_mean_errors(
 
     """
     arch = arch.to(device)
+    bn_adapt_arch = bn_adapt_arch.to(device)
     err_dict: Dict[int, List[float]] = {k: list() for k in topk}
+    err_dict_bn: Dict[int, List[float]] = {k: list() for k in topk}
 
     for x, t in loader:
         x, t = x.to(device), t.to(device)
 
         output = arch(x)
+        output_bn = bn_adapt_arch(x)
         for k, err in zip(topk, calc_errors(output, t, topk=topk)):
             err_dict[k].append(err.item())
+        for k, err in zip(topk, calc_errors(output_bn, t, topk=topk)):
+            err_dict_bn[k].append(err.item())
 
-    return [sum(err_dict[k]) / len(err_dict[k]) for k in err_dict]
+    return [sum(err_dict[k]) / len(err_dict[k]) for k in err_dict], [
+        sum(err_dict_bn[k]) / len(err_dict_bn[k]) for k in err_dict_bn
+    ]
 
 
 def eval_batchnorm_similarity(

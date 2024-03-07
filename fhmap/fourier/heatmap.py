@@ -7,9 +7,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import logging
 
 import fhmap
 import fhmap.fourier as fourier
@@ -42,7 +44,7 @@ def create_fourier_heatmap_from_error_matrix(
 
 
 def save_fourier_heatmap(
-    fhmap: torch.Tensor, savedir: pathlib.Path, suffix: str = ""
+    fhmap: torch.Tensor, savedir: pathlib.Path, suffix: str = "", vmin: float = 0.0, vmax: float = 1.0
 ) -> None:
     """Save Fourier Heat Map as a png image.
 
@@ -55,8 +57,8 @@ def save_fourier_heatmap(
     torch.save(fhmap, savedir / ("fhmap_data" + suffix + ".pth"))  # save raw data.
     sns.heatmap(
         fhmap.numpy(),
-        vmin=0.0,
-        vmax=1.0,
+        vmin=vmin,
+        vmax=vmax,
         cmap="jet",
         cbar=True,
         xticklabels=False,
@@ -102,6 +104,7 @@ def eval_fourier_heatmap(
     device: torch.device,
     topk: Tuple[int, ...] = (1,),
     savedir: Optional[pathlib.Path] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> List[torch.Tensor]:
     """Evaluate Fourier Heat Map about given architecture and dataset.
 
@@ -134,9 +137,12 @@ def eval_fourier_heatmap(
         )
     original_transforms: Final = dataset.transform.transforms
 
-    error_matrix_dict = {
-        k: torch.zeros(fhmap_height * fhmap_width).float() for k in topk
-    }
+    error_matrix_dict = {k: torch.zeros(fhmap_height * fhmap_width).float() for k in topk}
+    error_matrix_dict_bn = {k: torch.zeros(fhmap_height * fhmap_width).float() for k in topk}
+    # bn_adapted_arch = copy.deepcopy(arch)
+    # bn_adapted_arch = fhmap.AdaptiveBatchNorm.adapt_model(bn_adapted_arch, 0.0, device)
+    # logger.info(f"Adapted model: {bn_adapted_arch}")
+    # logger.info(f"Original model: {arch}")
 
     spectrums = fourier.get_spectrum(height, width, ignore_edge_size, ignore_edge_size)
     with tqdm(
@@ -144,13 +150,15 @@ def eval_fourier_heatmap(
     ) as pbar:  # without total progress par might not be shown.
         for i, spectrum in enumerate(pbar):  # Size of basis is [height, width]
             basis = fourier.spectrum_to_basis(spectrum, l2_normalize=True) * eps
+            bn_adapted_arch = copy.deepcopy(arch)
+            bn_adapted_arch = fhmap.AdaptiveBatchNorm.adapt_model(bn_adapted_arch, 0.0, device)
 
             # insert fourier noise by inpalce operation
             noised_transforms = copy.deepcopy(original_transforms)
             insert_fourier_noise(noised_transforms, basis)
 
             # overwrite torchvision.transforms.Compose.transforms
-            # dataset.transform.transforms = noised_transforms
+            dataset.transform.transforms = noised_transforms
 
             loader = DataLoader(
                 dataset,
@@ -160,10 +168,11 @@ def eval_fourier_heatmap(
                 pin_memory=True,
             )
 
-            for k, mean_err in zip(
-                topk, fhmap.eval_mean_errors(arch, loader, device, topk)
+            for k, (mean_err, mean_err_bn) in zip(
+                topk, fhmap.eval_mean_errors(arch, bn_adapted_arch, loader, device, topk)
             ):
                 error_matrix_dict[k][i] = mean_err
+                error_matrix_dict_bn[k][i] = mean_err_bn
 
             # show result to pbar
             results = OrderedDict()
@@ -173,14 +182,82 @@ def eval_fourier_heatmap(
             pbar.update()
 
     fourier_heatmaps: Final[List[torch.Tensor]] = [
+        create_fourier_heatmap_from_error_matrix(error_matrix_dict[k].view(fhmap_height, fhmap_width)) for k in topk
+    ]
+    fourier_heatmaps_bn: Final[List[torch.Tensor]] = [
+        create_fourier_heatmap_from_error_matrix(error_matrix_dict_bn[k].view(fhmap_height, fhmap_width)) for k in topk
+    ]
+    fourier_heatmaps_bn_original: Final[List[torch.Tensor]] = [
         create_fourier_heatmap_from_error_matrix(
-            error_matrix_dict[k].view(fhmap_height, fhmap_width)
+            error_matrix_dict_bn[k].view(fhmap_height, fhmap_width)
+            - error_matrix_dict[k].view(fhmap_height, fhmap_width)
         )
         for k in topk
     ]
 
     if savedir:
-        for k, fourier_heatmap in zip(topk, fourier_heatmaps):
+        for k, fourier_heatmap, fourier_heatmap_bn, fourier_heatmap_bn_original in zip(
+            topk, fourier_heatmaps, fourier_heatmaps_bn, fourier_heatmaps_bn_original
+        ):
             save_fourier_heatmap(fourier_heatmap / 100.0, savedir, f"_top{k}")
+            save_fourier_heatmap(fourier_heatmap_bn / 100.0, savedir, f"_top{k}_bn")
+            save_fourier_heatmap(
+                fourier_heatmap_bn_original / 100.0, savedir, f"_top{k}_bn_original", vmin=-1.0, vmax=1.0
+            )
 
     return fourier_heatmaps
+
+
+class AdaptiveBatchNorm(nn.Module):
+    """Use the source statistics as a prior on the target statistics"""
+
+    @staticmethod
+    def find_bns(parent, prior, device):
+        replace_mods = []
+        if parent is None:
+            return []
+        for name, child in parent.named_children():
+            child.requires_grad_(False)
+            if isinstance(child, nn.BatchNorm2d):
+                module = AdaptiveBatchNorm(child, prior, device)
+                replace_mods.append((parent, name, module))
+            else:
+                replace_mods.extend(AdaptiveBatchNorm.find_bns(child, prior, device))
+
+        return replace_mods
+
+    @staticmethod
+    def adapt_model(model, prior, device):
+        replace_mods = AdaptiveBatchNorm.find_bns(model, prior, device)
+        # print(f"| Found {len(replace_mods)} modules to be replaced.")
+        for parent, name, child in replace_mods:
+            setattr(parent, name, child)
+        return model
+
+    def __init__(self, layer, prior, device):
+        assert prior >= 0 and prior <= 1
+
+        super().__init__()
+        self.layer = layer
+        self.layer.eval()
+
+        self.norm = nn.BatchNorm2d(self.layer.num_features, affine=False, momentum=1.0).to(device)
+
+        self.prior = prior
+
+    def forward(self, input):
+        self.norm(input)
+
+        running_mean = self.prior * self.layer.running_mean + (1 - self.prior) * self.norm.running_mean
+        running_var = self.prior * self.layer.running_var + (1 - self.prior) * self.norm.running_var
+
+        return F.batch_norm(
+            input,
+            running_mean,
+            running_var,
+            self.layer.weight,
+            self.layer.bias,
+            False,
+            0,
+            self.layer.eps,
+        )
