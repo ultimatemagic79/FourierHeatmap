@@ -14,6 +14,7 @@ from tqdm import tqdm
 import fhmap
 import fhmap.fourier as fourier
 from fhmap.fourier.noise import AddFourierNoise
+import logging
 
 
 def create_fourier_heatmap_from_error_matrix(
@@ -55,8 +56,6 @@ def save_fourier_heatmap(
     torch.save(fhmap, savedir / ("fhmap_data" + suffix + ".pth"))  # save raw data.
     sns.heatmap(
         fhmap.numpy(),
-        vmin=0.0,
-        vmax=1.0,
         cmap="jet",
         cbar=True,
         xticklabels=False,
@@ -92,6 +91,26 @@ def insert_fourier_noise(transforms: List, basis: torch.Tensor) -> None:
     transforms.insert(insert_index, AddFourierNoise(basis))
 
 
+def get_batchnorm_layers_names(model: nn.Module) -> list:
+    """
+    アーキテクチャ内のBatchNorm層の名前を取得します。
+
+    Args:
+        model (nn.Module): BatchNorm層の名前を取得するモデル。
+
+    Returns:
+        list: BatchNorm層の名前のリスト。
+    """
+    bn_names = []
+    # モデルの各層に対してループ
+    for name, module in model.named_modules():
+        # BatchNorm層をチェック
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            if not "_aug" in name:
+                bn_names.append(name)
+    return bn_names
+
+
 def eval_fourier_heatmap(
     input_size: int,
     ignore_edge_size: int,
@@ -100,8 +119,8 @@ def eval_fourier_heatmap(
     dataset: torchvision.datasets.VisionDataset,
     batch_size: int,
     device: torch.device,
-    topk: Tuple[int, ...] = (1,),
     savedir: Optional[pathlib.Path] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> List[torch.Tensor]:
     """Evaluate Fourier Heat Map about given architecture and dataset.
 
@@ -133,10 +152,35 @@ def eval_fourier_heatmap(
             f"type of dataset.transform should be torchvision.transforms.Compose, not {type(dataset.transform)}"
         )
     original_transforms: Final = dataset.transform.transforms
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+    )
+    arch = arch.to(device)
+    arch.eval()
+    bn_names = get_batchnorm_layers_names(arch)
+    logger.info(f"BatchNorm layers len: {len(bn_names)}")
+    logger.info(f"BatchNorm layers: {bn_names}")
+    original_bn_outputs = [[] for _ in bn_names]
+    for x, _ in loader:
+        with torch.no_grad():
+            x = x.to(device)
+            outputs = fhmap.get_batchnorm_output(arch, x)
+            for i, output in enumerate(outputs):
+                original_bn_outputs[i].append(output)
 
-    error_matrix_dict = {
-        k: torch.zeros(fhmap_height * fhmap_width).float() for k in topk
-    }
+    batch_norm_k = len(bn_names)
+
+    # Log the type and shape of original_bn_outputs
+    logger.info(f"Type of original_bn_outputs: {type(original_bn_outputs)}")
+    logger.info(
+        f"Shape of original_bn_outputs: {batch_norm_k, len(original_bn_outputs[0]), original_bn_outputs[0][0].shape}"
+    )
+
+    similarity_matrix_dict = {k: torch.zeros(fhmap_height * fhmap_width).float() for k in range(batch_norm_k)}
 
     spectrums = fourier.get_spectrum(height, width, ignore_edge_size, ignore_edge_size)
     with tqdm(
@@ -150,7 +194,7 @@ def eval_fourier_heatmap(
             insert_fourier_noise(noised_transforms, basis)
 
             # overwrite torchvision.transforms.Compose.transforms
-            # dataset.transform.transforms = noised_transforms
+            dataset.transform.transforms = noised_transforms
 
             loader = DataLoader(
                 dataset,
@@ -160,27 +204,23 @@ def eval_fourier_heatmap(
                 pin_memory=True,
             )
 
-            for k, mean_err in zip(
-                topk, fhmap.eval_mean_errors(arch, loader, device, topk)
-            ):
-                error_matrix_dict[k][i] = mean_err
+            for k, sim in enumerate(fhmap.eval_batchnorm_similarity(arch, loader, original_bn_outputs, device)):
+                similarity_matrix_dict[k][i] = sim
 
             # show result to pbar
             results = OrderedDict()
-            for k, v in error_matrix_dict.items():
-                results[f"err{k}"] = v[i].item()
+            # for k, v in similarity_matrix_dict.items():
+            #     results[f"similarity_{k}"] = v[i].item()
             pbar.set_postfix(results)
             pbar.update()
 
     fourier_heatmaps: Final[List[torch.Tensor]] = [
-        create_fourier_heatmap_from_error_matrix(
-            error_matrix_dict[k].view(fhmap_height, fhmap_width)
-        )
-        for k in topk
+        create_fourier_heatmap_from_error_matrix(similarity_matrix_dict[k].view(fhmap_height, fhmap_width))
+        for k in range(len(original_bn_outputs))
     ]
 
     if savedir:
-        for k, fourier_heatmap in zip(topk, fourier_heatmaps):
-            save_fourier_heatmap(fourier_heatmap / 100.0, savedir, f"_top{k}")
+        for k, fourier_heatmap in enumerate(fourier_heatmaps):
+            save_fourier_heatmap(fourier_heatmap, savedir, f"_bn_l2_morm{bn_names[k]}")
 
     return fourier_heatmaps

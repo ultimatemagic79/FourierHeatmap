@@ -38,11 +38,10 @@ class EvalFhmapConfig:
     env: schema.EnvConfig = schema.DefaultEnvConfig  # type: ignore
     dataset: schema.DatasetConfig = schema.Cifar10Config  # type: ignore
     # ungrouped configs
-    batch_size: int = 512
+    batch_size: int = 64
     eps: float = 4.0
     ignore_edge_size: int = 0
     num_samples: int = -1
-    topk: Tuple = (1, 5)
     weightpath: str = MISSING
 
 
@@ -113,8 +112,8 @@ def eval_fhmap(cfg: EvalFhmapConfig) -> None:
         datamodule.test_dataset,
         cfg.batch_size,
         cast(torch.device, device),  # needed for passing mypy check.
-        cfg.topk,
         pathlib.Path("."),
+        logger,
     )
 
 
